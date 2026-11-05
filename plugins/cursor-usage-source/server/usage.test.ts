@@ -46,6 +46,18 @@ function mockFetch(handlers: Map<string, () => Response>): typeof fetch {
   }) as unknown as typeof fetch;
 }
 
+// Stands in for `security find-generic-password -w`, printing `output` for any lookup.
+function securityPrinting(output: string | null) {
+  return vi.fn(async (_args: string[]) => output);
+}
+
+function authorizationRecorder(requests: Array<string | null>, body: unknown): typeof fetch {
+  return (async (_url: string | URL | Request, init?: RequestInit) => {
+    requests.push(new Headers(init?.headers).get("Authorization"));
+    return jsonResponse(body);
+  }) as typeof fetch;
+}
+
 function jsonResponse(body: unknown, status = 200): Response {
   return new Response(JSON.stringify(body), {
     status,
@@ -342,18 +354,72 @@ describe("cursor usage source", () => {
       ]);
     });
 
-    it("reads ~/.cursor/auth.json on macOS only when cursor-agent uses the file store", async () => {
+    it("reads ~/.cursor/auth.json on macOS when cursor-agent uses the file store", async () => {
       const authPath = join(sessionHome, ".cursor", "auth.json");
       writeAuthJson(authPath);
-      expect(await discoverSession(cursorSession({}), "darwin")).toEqual([]);
+      const security = securityPrinting("keychain-token");
       expect(
-        await discoverSession(cursorSession({ AGENT_CLI_CREDENTIAL_STORE: "file" }), "darwin"),
+        await discoverSession(
+          cursorSession({ AGENT_CLI_CREDENTIAL_STORE: "file" }),
+          "darwin",
+          security,
+        ),
       ).toEqual([
         {
           key: expect.stringMatching(/^store-[a-f0-9]{64}$/),
           input: { store: "file", locator: authPath },
         },
       ]);
+      expect(security).not.toHaveBeenCalled();
+    });
+
+    it("reads cursor-agent's Keychain login on macOS by default", async () => {
+      writeAuthJson(join(sessionHome, ".cursor", "auth.json"));
+      const token = `e30.${Buffer.from(JSON.stringify({ sub: "user-a" })).toString("base64url")}.sig`;
+      const security = securityPrinting(`${token}\n`);
+      const accounts = await discoverSession(cursorSession({}), "darwin", security);
+      expect(accounts).toEqual([
+        {
+          key: expect.stringMatching(/^account-[a-f0-9]{64}$/),
+          input: { store: "keychain", locator: "cursor-access-token" },
+        },
+      ]);
+      expect(security).toHaveBeenCalledWith([
+        "find-generic-password",
+        "-a",
+        "cursor-user",
+        "-s",
+        "cursor-access-token",
+        "-w",
+      ]);
+
+      // The Keychain login is the same account as a desktop login with the same subject.
+      writeCursorAuthJson(homeDir, token);
+      expect(accounts[0]!.key).toBe((await discover())[0]!.key);
+
+      const requests: Array<string | null> = [];
+      const report = await fetchUsage(
+        accounts[0]!.input as Parameters<typeof fetchUsage>[0],
+        authorizationRecorder(requests, { planUsage: { totalPercentUsed: 12 } }),
+        security,
+      );
+      expect(requests).toEqual([`Bearer ${token}`]);
+      expect(report.status).toBe("available");
+    });
+
+    it("returns no login when cursor-agent's Keychain item is missing", async () => {
+      const security = securityPrinting(null);
+      expect(await discoverSession(cursorSession({}), "darwin", security)).toEqual([]);
+    });
+
+    it.each([
+      ["a CURSOR_API_KEY session", { CURSOR_API_KEY: "key" }],
+      ["a CURSOR_AUTH_TOKEN session", { CURSOR_AUTH_TOKEN: "token" }],
+      ["an in-memory credential store", { AGENT_CLI_CREDENTIAL_STORE: "memory" }],
+    ])("skips the Keychain on macOS for %s", async (_scenario, env) => {
+      const security = securityPrinting("keychain-token");
+      expect(await discoverSession(cursorSession(env), "darwin", security)).toEqual([]);
+      expect(security).not.toHaveBeenCalled();
     });
 
     it.each([
