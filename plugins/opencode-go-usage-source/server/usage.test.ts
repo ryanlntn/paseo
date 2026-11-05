@@ -1,10 +1,66 @@
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, beforeEach, expect, test } from "vitest";
+import { afterEach, beforeEach, describe, expect, test } from "vitest";
 import { discover, fetchUsage } from "./usage.js";
 
 import { inputSchema } from "../shared/input.js";
+
+// node:sqlite has no @types/node@20 typings; require it with a narrow local type.
+const testRequire = createRequire(import.meta.url);
+interface TestSqliteDb {
+  exec(sql: string): void;
+  prepare(sql: string): { run(...params: unknown[]): void };
+  close(): void;
+}
+
+interface CredentialRow {
+  id: string;
+  integrationId: string;
+  value: unknown;
+  active: number | null;
+  timeUpdated: number;
+}
+
+// Mirrors OpenCode 2.x's `credential` table in opencode.db.
+function writeOpencodeDb(directory: string, rows: CredentialRow[]): string {
+  const { DatabaseSync } = testRequire("node:sqlite") as {
+    DatabaseSync: new (path: string) => TestSqliteDb;
+  };
+  const path = join(directory, "opencode.db");
+  const db = new DatabaseSync(path);
+  db.exec(
+    "CREATE TABLE IF NOT EXISTS credential (id text PRIMARY KEY, integration_id text, label text NOT NULL, value text NOT NULL, connector_id text, method_id text, active integer, time_created integer NOT NULL, time_updated integer NOT NULL)",
+  );
+  const insert = db.prepare(
+    "INSERT INTO credential (id, integration_id, label, value, active, time_created, time_updated) VALUES (?, ?, 'API key', ?, ?, ?, ?)",
+  );
+  for (const row of rows)
+    insert.run(
+      row.id,
+      row.integrationId,
+      JSON.stringify(row.value),
+      row.active,
+      row.timeUpdated,
+      row.timeUpdated,
+    );
+  db.close();
+  return path;
+}
+
+function goKey(id: string, key: string, timeUpdated: number, active: number | null = null) {
+  return { id, integrationId: "opencode-go", value: { type: "key", key }, active, timeUpdated };
+}
+
+async function requestedKey(path: string): Promise<string | null> {
+  let authorization: string | null = null;
+  await fetchUsage({ path }, (async (_url: string | URL | Request, init?: RequestInit) => {
+    authorization = new Headers(init?.headers).get("Authorization");
+    return Response.json(upstreamResponse);
+  }) as typeof fetch);
+  return authorization;
+}
 
 let fixtureDirectory: string;
 let fixturePath: string;
@@ -101,4 +157,88 @@ test.each(["missing file", "unrelated file"])("discovers no accounts for %s", as
   const path = join(fixtureDirectory, "missing.json");
   if (scenario === "unrelated file") await writeFile(path, "{}");
   expect(await discover(path)).toEqual([]);
+});
+
+describe("OpenCode 2.x credential database", () => {
+  test("discovers the Go key from opencode.db under the same account key as auth.json", async () => {
+    const before = await discover(fixturePath);
+    await rm(fixturePath);
+    const dbPath = writeOpencodeDb(fixtureDirectory, [goKey("cred_go", "db-key", 10)]);
+    const content = await readFile(dbPath);
+    expect(await discover(fixturePath)).toEqual(before);
+    expect(await requestedKey(fixturePath)).toBe("Bearer db-key");
+    expect(await readFile(dbPath)).toEqual(content);
+  });
+
+  test("prefers the database over auth.json", async () => {
+    writeOpencodeDb(fixtureDirectory, [goKey("cred_go", "db-key", 10)]);
+    expect(await requestedKey(fixturePath)).toBe("Bearer db-key");
+  });
+
+  test("picks the most recently updated Go key when none is active", async () => {
+    writeOpencodeDb(fixtureDirectory, [
+      goKey("cred_old", "old-key", 10),
+      goKey("cred_new", "new-key", 30),
+      { ...goKey("cred_other", "other-key", 50), integrationId: "opencode" },
+    ]);
+    expect(await requestedKey(fixturePath)).toBe("Bearer new-key");
+  });
+
+  test("prefers an active Go key over a newer inactive one", async () => {
+    writeOpencodeDb(fixtureDirectory, [
+      goKey("cred_active", "active-key", 10, 1),
+      goKey("cred_newer", "newer-key", 30),
+    ]);
+    expect(await requestedKey(fixturePath)).toBe("Bearer active-key");
+  });
+
+  test("skips a Go row that holds no API key", async () => {
+    writeOpencodeDb(fixtureDirectory, [
+      goKey("cred_old", "old-key", 10),
+      { ...goKey("cred_oauth", "", 30), value: { type: "oauth", access: "token" } },
+    ]);
+    expect(await requestedKey(fixturePath)).toBe("Bearer old-key");
+  });
+
+  test("falls back to auth.json when the database has no Go key", async () => {
+    writeOpencodeDb(fixtureDirectory, [
+      { ...goKey("cred_other", "other-key", 50), integrationId: "opencode" },
+    ]);
+    expect(await requestedKey(fixturePath)).toBe("Bearer fixture-secret");
+  });
+
+  test("falls back to auth.json when the database is not a credential store", async () => {
+    await writeFile(join(fixtureDirectory, "opencode.db"), "not a database");
+    expect(await requestedKey(fixturePath)).toBe("Bearer fixture-secret");
+  });
+});
+
+test("tells the user to replace an expired API key instead of signing in again", async () => {
+  const body = {
+    error: {
+      code: "api_key_expired",
+      message: "This API key has expired. Create a new API key in OpenCode Console.",
+    },
+  };
+  const report = await fetchUsage({ path: fixturePath }, async () =>
+    Response.json(body, { status: 401 }),
+  );
+  expect(report).toEqual({
+    status: "unavailable",
+    problem: {
+      kind: "no_quota",
+      detail:
+        "OpenCode Go API key expired. Create a new key in OpenCode Console, then run opencode auth login.",
+    },
+  });
+});
+
+test("keeps the refresh remedy for a 401 that is not an expired key", async () => {
+  const report = await fetchUsage({ path: fixturePath }, async () =>
+    Response.json({ error: { code: "invalid_api_key" } }, { status: 401 }),
+  );
+  expect(report).toEqual({
+    status: "unavailable",
+    problem: { kind: "rejected", status: 401, refreshedBy: "opencode" },
+  });
 });
